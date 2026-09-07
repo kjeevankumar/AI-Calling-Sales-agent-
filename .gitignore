@@ -1,0 +1,69 @@
+# Environments & Secrets
+.env
+.env.*
+!.env.example
+*.env
+
+# Python Virtual Environments & Cache
+venv/
+env/
+ENV/
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Databases & Backups
+*.db
+*.sqlite
+*.sqlite3
+calls.db
+
+# Logs & Tunnel Dumps
+*.log
+tunnel.log
+localtunnel.log
+tunnel_localhost.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# Node / Frontend
+node_modules/
+dist/
+dist-ssr/
+*.local
+.vite/
+
+# IDE & Editor Configs
+.idea/
+.vscode/
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?
+.gemini/
+.agents/
+
+# Operating System Files
+Thumbs.db
+[Dd]esktop.ini
+.DS_Store
