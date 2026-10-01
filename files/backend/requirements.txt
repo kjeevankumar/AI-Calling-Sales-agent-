@@ -7,3 +7,4 @@ openpyxl
 python-multipart
 httpx
 python-dotenv
+psycopg2-binary

@@ -55,10 +55,11 @@ tunnel_log_paths = [
 
 def get_server_url() -> str:
     global SERVER_URL
-    # Check env first, if it is explicitly configured and not default
-    env_url = os.getenv("SERVER_URL", "")
-    if env_url and env_url != "https://your-server.com" and not env_url.endswith("lhr.life"):
-        return env_url
+    # Check env first: if explicitly configured and not default placeholder, use it!
+    env_url = os.getenv("SERVER_URL", "").strip().rstrip("/")
+    if env_url and env_url != "https://your-server.com":
+        SERVER_URL = env_url
+        return SERVER_URL
 
     detected_url = None
     for path in tunnel_log_paths:
@@ -79,13 +80,19 @@ def get_server_url() -> str:
                             if match:
                                 detected_url = match.group(0)
                                 break
+                        elif "ngrok-free.app" in line or "ngrok.app" in line or "trycloudflare.com" in line:
+                            import re
+                            match = re.search(r"https://[a-zA-Z0-9.-]+", line)
+                            if match:
+                                detected_url = match.group(0)
+                                break
             except Exception as e:
                 print(f"Error reading {path} for dynamic URL detection: {e}")
             if detected_url:
                 break
 
     if detected_url:
-        SERVER_URL = detected_url
+        SERVER_URL = detected_url.rstrip("/")
     elif not SERVER_URL or SERVER_URL == "https://your-server.com":
         SERVER_URL = "https://your-server.com"
 
@@ -470,6 +477,7 @@ async def start_campaign():
     db.close()
 
     results = []
+    server_base = get_server_url().rstrip("/")
     auth = (TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
     async with httpx.AsyncClient() as client:
         for lead in leads_to_dial:
@@ -477,8 +485,8 @@ async def start_campaign():
             payload = {
                 "To"            : lead["phone_number"],
                 "From"          : TWILIO_PHONE_NUMBER,
-                "Url"           : f"{get_server_url()}/api/call/twiml?lead_id={lead['id']}",
-                "StatusCallback": f"{get_server_url()}/api/call/status",
+                "Url"           : f"{server_base}/api/call/twiml?lead_id={lead['id']}",
+                "StatusCallback": f"{server_base}/api/call/status",
             }
             resp = await client.post(url, data=payload, auth=auth)
             if resp.status_code == 201:
@@ -506,15 +514,20 @@ async def dial_lead(lead_id: str):
         db.close()
         raise HTTPException(status_code=404, detail="Lead not found")
 
+    phone_to_dial = clean_and_format_phone(lead.phone_number)
+    if not phone_to_dial:
+        db.close()
+        raise HTTPException(status_code=400, detail="Invalid phone number format")
 
+    server_base = get_server_url().rstrip("/")
     auth = (TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
     async with httpx.AsyncClient() as client:
         url = f"https://api.twilio.com/2010-04-01/Accounts/{TWILIO_ACCOUNT_SID}/Calls.json"
         payload = {
-            "To"            : lead.phone_number,
+            "To"            : phone_to_dial,
             "From"          : TWILIO_PHONE_NUMBER,
-            "Url"           : f"{get_server_url()}/api/call/twiml?lead_id={lead_id}",
-            "StatusCallback": f"{get_server_url()}/api/call/status",
+            "Url"           : f"{server_base}/api/call/twiml?lead_id={lead_id}",
+            "StatusCallback": f"{server_base}/api/call/status",
         }
         resp = await client.post(url, data=payload, auth=auth)
         if resp.status_code == 201:
@@ -522,32 +535,58 @@ async def dial_lead(lead_id: str):
             lead.status   = "dialing"
             lead.call_sid = call_data.get("sid", "")
             db.commit()
-            phone = lead.phone_number
             db.close()
-            return {"message": "Call initiated", "phone": phone, "status": "dialing"}
+            return {"message": f"Calling {phone_to_dial}...", "phone": phone_to_dial, "status": "dialing"}
         else:
             db.close()
-            raise HTTPException(status_code=500, detail=f"Twilio error: {resp.text}")
+            error_msg = resp.text
+            try:
+                err_data = resp.json()
+                error_msg = err_data.get("message") or resp.text
+            except Exception:
+                pass
+            raise HTTPException(status_code=resp.status_code if resp.status_code < 500 else 500, detail=f"Twilio error: {error_msg}")
 
+
+@app.get("/api/health")
+def health_check():
+    """Health check endpoint for production monitoring and status checking."""
+    return {
+        "status": "healthy",
+        "server_url": get_server_url(),
+        "twilio_configured": bool(TWILIO_ACCOUNT_SID and TWILIO_AUTH_TOKEN and TWILIO_PHONE_NUMBER),
+        "gemini_configured": bool(GEMINI_API_KEY),
+    }
 
 
 # ─── TwiML Stream Endpoint ───────────────────────────────────────────────────
 from fastapi.responses import Response
 
 @app.api_route("/api/call/twiml", methods=["GET", "POST"])
-async def get_twiml(lead_id: Optional[str] = None):
+async def get_twiml(request: Request, lead_id: Optional[str] = None):
     """Returns TwiML instructing Twilio to bridge the call to our /ws/call WebSocket."""
-    ws_url = get_server_url().replace("https://", "wss://").replace("http://", "ws://")
+    if not lead_id:
+        lead_id = request.query_params.get("lead_id")
+    if not lead_id and request.method == "POST":
+        try:
+            form = await request.form()
+            lead_id = form.get("lead_id") or form.get("leadId")
+        except Exception:
+            pass
+
+    server_base = get_server_url().rstrip("/")
+    ws_url = server_base.replace("https://", "wss://").replace("http://", "ws://")
     
-    # Pass lead_id in custom parameters so Twilio includes it in the stream start event
+    stream_url = f"{ws_url}/ws/call"
     parameter_xml = ""
     if lead_id:
+        stream_url = f"{ws_url}/ws/call?lead_id={lead_id}"
         parameter_xml = f'<Parameter name="leadId" value="{lead_id}" />'
         
     twiml = f"""<?xml version="1.0" encoding="UTF-8"?>
 <Response>
     <Connect>
-        <Stream url="{ws_url}/ws/call" track="inbound_track">
+        <Stream url="{stream_url}">
             {parameter_xml}
         </Stream>
     </Connect>
@@ -566,11 +605,12 @@ async def call_websocket(ws: WebSocket):
     call_sid     = None
     stream_sid   = None
     phone_number = None
-    lead_id      = None
+    # Check query params first for resilient lead_id detection
+    lead_id      = ws.query_params.get("lead_id")
     transcript_turns = []
     start_time   = datetime.utcnow()
 
-    # 1. Wait for the initial telephony connection events (connected, then start)
+    # 1. Wait for telephony connection events (connected, dtmf, start)
     try:
         while True:
             first_msg = await ws.receive_text()
@@ -585,13 +625,16 @@ async def call_websocket(ws: WebSocket):
                 stream_sid = start_data.get("streamSid") or start_data.get("stream_sid") or data.get("streamSid") or ""
                 phone_number = start_data.get("from") or ""
                 custom_params = start_data.get("customParameters") or start_data.get("custom_parameters") or {}
-                lead_id = custom_params.get("leadId") or custom_params.get("lead_id") or None
+                if not lead_id:
+                    lead_id = custom_params.get("leadId") or custom_params.get("lead_id") or None
                 print(f"Call started: {call_sid} (Stream: {stream_sid}) from {phone_number} (Lead ID: {lead_id})")
                 break
+            elif event in ("dtmf", "mark"):
+                print(f"Telephony stream received {event} before start. Continuing...")
+                continue
             else:
-                print(f"Unexpected early event: {event}. Closing connection.")
-                await ws.close()
-                return
+                print(f"Telephony event received: {event}. Continuing...")
+                continue
     except Exception as e:
         print(f"Failed to receive start event from telephony: {e}")
         await ws.close()
@@ -800,16 +843,20 @@ async def call_websocket(ws: WebSocket):
                                     pcm_8k = resample_pcm_24k_to_8k(pcm_24k)
                                     # 3. Encode PCM 8kHz to G.711 mu-law (8kHz)
                                     mulaw_bytes = pcm_to_mulaw(pcm_8k)
-                                    # 4. Base64 encode mu-law bytes
-                                    mulaw_b64 = base64.b64encode(mulaw_bytes).decode("utf-8")
-
-                                    # Send JSON-wrapped mu-law audio targeted by streamSid
-                                    media_msg = json.dumps({
-                                        "event": "media",
-                                        "streamSid": stream_sid,
-                                        "media": {"payload": mulaw_b64}
-                                    })
-                                    await ws.send_text(media_msg)
+                                    
+                                    # Chunk audio into standard 320-byte (40ms) packets to prevent
+                                    # overloading Twilio's media stream audio buffer
+                                    CHUNK_SIZE = 320
+                                    for offset in range(0, len(mulaw_bytes), CHUNK_SIZE):
+                                        chunk = mulaw_bytes[offset:offset + CHUNK_SIZE]
+                                        mulaw_b64 = base64.b64encode(chunk).decode("utf-8")
+                                        media_msg = json.dumps({
+                                            "event": "media",
+                                            "streamSid": stream_sid,
+                                            "media": {"payload": mulaw_b64}
+                                        })
+                                        await ws.send_text(media_msg)
+                                        await asyncio.sleep(0.001)
 
                         except json.JSONDecodeError:
                             continue
