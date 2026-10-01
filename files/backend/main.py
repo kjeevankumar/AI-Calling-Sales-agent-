@@ -581,8 +581,7 @@ async def get_twiml(request: Request, lead_id: Optional[str] = None):
     stream_url = f"{ws_url}/ws/call"
     parameter_xml = ""
     if lead_id:
-        stream_url = f"{ws_url}/ws/call?lead_id={lead_id}"
-        parameter_xml = f'<Parameter name="leadId" value="{lead_id}" />'
+        parameter_xml = f'<Parameter name="leadId" value="{lead_id}" />\n            <Parameter name="lead_id" value="{lead_id}" />'
         
     twiml = f"""<?xml version="1.0" encoding="UTF-8"?>
 <Response>
@@ -751,6 +750,8 @@ async def call_websocket(ws: WebSocket):
             await gemini_ws.send(json.dumps(init_msg))
             print(f"Sent initial greeting trigger to Gemini for shop: {shop_name}")
 
+            hangup_scheduled = False
+
             # ── Bridge audio bidirectionally ────────────────────────────────
             async def telephony_to_gemini():
                 """Read audio from telephony channel, transcode, and forward to Gemini."""
@@ -806,7 +807,7 @@ async def call_websocket(ws: WebSocket):
 
             async def gemini_to_telephony():
                 """Read Gemini responses, transcode, and send audio back to telephony."""
-                nonlocal current_customer_text, current_agent_text
+                nonlocal current_customer_text, current_agent_text, hangup_scheduled
                 try:
                     async for message in gemini_ws:
                         try:
@@ -856,9 +857,11 @@ async def call_websocket(ws: WebSocket):
                                         "message you on whatsapp", "message you with some sample",
                                         "thank you so much for your time", "goodbye"
                                     ]
-                                    if any(phrase in lowered for phrase in closing_phrases):
-                                        print(f"[Auto-Hangup] Closing phrase detected. Hanging up call in 4.5s...")
-                                        asyncio.create_task(delayed_hangup(call_sid, delay=4.5))
+                                    if not hangup_scheduled and any(phrase in lowered for phrase in closing_phrases):
+                                        hangup_scheduled = True
+                                        target_sid = call_sid
+                                        print(f"[Auto-Hangup] Closing phrase detected. Hanging up call {target_sid} in 5.0s...")
+                                        asyncio.create_task(delayed_hangup(target_sid, delay=5.0))
 
                             # Forward audio back to telephony
                             model_turn = server_content.get("modelTurn", {})
@@ -921,7 +924,11 @@ async def call_websocket(ws: WebSocket):
         sentiment, summary = await analyze_call(full_transcript)
 
         db = SessionLocal()
-        record = db.query(CallRecord).filter_by(call_sid=call_sid).first()
+        record = None
+        if call_sid:
+            record = db.query(CallRecord).filter_by(call_sid=call_sid).first()
+        if not record and lead_id:
+            record = db.query(CallRecord).filter_by(id=lead_id).first()
         if record:
             record.status        = "completed"
             record.transcript    = full_transcript
@@ -929,6 +936,8 @@ async def call_websocket(ws: WebSocket):
             record.summary       = summary
             record.duration_secs = duration_secs
             record.completed_at  = end_time
+            if call_sid and not record.call_sid:
+                record.call_sid = call_sid
             db.commit()
         db.close()
         print(f"Call {call_sid} done. Sentiment: {sentiment}")
