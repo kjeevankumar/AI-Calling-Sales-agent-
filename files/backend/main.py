@@ -149,7 +149,7 @@ Call structure:
    - "I don't need a website" -> "I understand, but a website works like a 24/7 digital showroom. Having a website increases your visibility on Google by 3 times compared to just a maps listing, bringing consistent clients."
    - "How much does it cost?" -> "Our standard business websites range transparently between ₹5,000 to ₹30,000. For e-commerce, we even offer a ₹0 upfront model where we partner on sales. I can have Jeevan WhatsApp you sample designs."
 7. Call to Action: If interested, say: "Perfect! I will have Jeevan message you on this number on WhatsApp with some sample designs and packages. Thank you so much for your time, have a wonderful day!"
-8. If not interested: Thank them politely and hang up.
+8. If not interested: Thank them politely: "No problem at all! Thank you so much for your time, have a wonderful day!"
 
 Rules:
 - Speak dynamically, warm, and conversationally.
@@ -157,7 +157,8 @@ Rules:
 - Be extremely polite, respectful, and never pushy.
 - AVOID GREETING LOOPS: Do not repeat greetings, and do not say "Hello" multiple times.
 - Once you greet the customer and they respond (e.g. saying "Yes", "Hello", "Yes speaking", etc.), immediately transition to introducing yourself and G1 Digitalizing (Step 3: "I'm Priya from G1 Digitalizing..."). Do not say "Hello" again.
-- Ignore background noises, keypress sounds (DTMF beeps), or short clicks. Do not respond to beeps or noise.
+- DO NOT STOP SPEAKING FOR BACKGROUND NOISE: Only pause or yield if the customer is clearly asking a question or speaking a full phrase. Ignore breaths, background hiss, clicks, or brief filler sounds like 'hmm' or 'ah'.
+- Once you deliver your final polite closing (thanking them and wishing them a wonderful day), conclude naturally so the call can hang up.
 """
 
 # ─── Audio Transcoding & Resampling Engine ────────────────────────────────────
@@ -594,6 +595,22 @@ async def get_twiml(request: Request, lead_id: Optional[str] = None):
     return Response(content=twiml, media_type="application/xml")
 
 
+async def delayed_hangup(call_sid: str, delay: float = 4.0):
+    """Wait for final audio to finish playing on customer phone, then cleanly hang up the call via Twilio."""
+    if not call_sid:
+        return
+    await asyncio.sleep(delay)
+    try:
+        import httpx
+        auth = (TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
+        url = f"https://api.twilio.com/2010-04-01/Accounts/{TWILIO_ACCOUNT_SID}/Calls/{call_sid}.json"
+        async with httpx.AsyncClient() as client:
+            resp = await client.post(url, data={"Status": "completed"}, auth=auth)
+            print(f"[Auto-Hangup] Twilio call {call_sid} hung up cleanly: status {resp.status_code}")
+    except Exception as e:
+        print(f"[Auto-Hangup] Failed to end call {call_sid}: {e}")
+
+
 # ─── WebSocket handler — Telephony audio <-> Gemini Live API ──────────────────
 @app.websocket("/ws/call")
 async def call_websocket(ws: WebSocket):
@@ -831,6 +848,17 @@ async def call_websocket(ws: WebSocket):
                                         print(f"Agent (Priya): {text}")
                                     except Exception:
                                         pass
+
+                                    # Check for call termination intent from Priya
+                                    lowered = current_agent_text.lower()
+                                    closing_phrases = [
+                                        "have a wonderful day", "have a great day",
+                                        "message you on whatsapp", "message you with some sample",
+                                        "thank you so much for your time", "goodbye"
+                                    ]
+                                    if any(phrase in lowered for phrase in closing_phrases):
+                                        print(f"[Auto-Hangup] Closing phrase detected. Hanging up call in 4.5s...")
+                                        asyncio.create_task(delayed_hangup(call_sid, delay=4.5))
 
                             # Forward audio back to telephony
                             model_turn = server_content.get("modelTurn", {})
